@@ -106,10 +106,11 @@ def evaluate_model(model_path, config):
     r2 = r2_score(targets.flatten(), predictions.flatten())
     corr, _ = pearsonr(targets.flatten(), predictions.flatten())
     
+    # Convert numpy types to native Python types for JSON serialization
     eval_results = {
-        "mse": mse,
-        "r2": r2,
-        "pearson_correlation": corr,
+        "mse": float(mse),
+        "r2": float(r2),
+        "pearson_correlation": float(corr),
         "run_id": run_id
     }
     
