@@ -24,14 +24,14 @@ var/
 .ipynb_checkpoints
 
 # PyTorch
-*.pt
-*.pth
+#*.pt
+#*.pth
 
 # Data files
-*.npy
-*.h5
-*.h5ad
-*.parquet
+#*.npy
+#*.h5
+#*.h5ad
+#*.parquet
 data/raw/
 data/processed/
 
@@ -39,8 +39,8 @@ data/processed/
 models/checkpoints/
 
 # Results
-results/metrics/
-results/figures/
+#results/metrics/
+#results/figures/
 
 # Logs
 logs/
