@@ -1,0 +1,26 @@
+{
+    "data_paths": {
+        "source_data": "data/processed/source_data.npy",
+        "target_data": "data/processed/target_data.npy",
+        "source_genes": "data/processed/source_genes.npy",
+        "target_genes": "data/processed/target_genes.npy"
+    },
+    "model": {
+        "latent_dim": 384,
+        "hidden_dim": 128
+    },
+    "training": {
+        "batch_size": 128,
+        "learning_rate": 0.001,
+        "weight_decay": 1e-4,
+        "num_epochs": 50,
+        "early_stopping_patience": 5,
+        "grad_clip": 5.0,
+        "train_split": 0.7,
+        "loss_weights": {
+            "recon_source": 0.3,
+            "recon_target": 0.7,
+            "latent": 0.2
+        }
+    }
+}
