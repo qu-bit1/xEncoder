@@ -45,7 +45,7 @@ def evaluate_model(model_path, config):
     )
     data_loader = torch.utils.data.DataLoader(
         dataset, 
-        batch_size=config['batch_size'], 
+        batch_size=config['training']['batch_size'], 
         shuffle=False
     )
     
@@ -224,7 +224,9 @@ if __name__ == "__main__":
             'latent_dim': 384,
             'hidden_dim': 128
         },
-        'batch_size': 128
+        'training': {
+            'batch_size': 128
+        }
     }
     
     # Evaluate the model (replace with your model path)
