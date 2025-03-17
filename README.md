@@ -8,6 +8,10 @@ This project addresses a key challenge in spatial transcriptomics: predicting ge
 2. Computationally predict the expression of thousands of additional genes
 3. Gain insights into cellular states and functions that would otherwise require more expensive or technically challenging experiments
 
+## Alignment
+
+First align both the tissues using the code given in the directory `tissue-alignment`
+
 ## Model Architecture
 
 The project implements a multi-encoder single latent space single decoder architecture:
