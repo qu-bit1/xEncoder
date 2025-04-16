@@ -20,19 +20,22 @@ import matplotlib.colors as mcolors
 # Set precision for better GPU performance
 torch.set_float32_matmul_precision('high')
 
-class SCVISharedLatentEncoder(nn.Module):
+class SCVISharedLatentEncoderWithScVIDecoder(nn.Module):
     """
-    A model that combines two pre-trained scVI encoders and projects them into a shared latent space.
+    A model that combines two pre-trained scVI encoders and a pre-trained scVI decoder.
+    Projects source and target latent representations into a shared latent space,
+    then uses the target scVI model's decoder to reconstruct target features.
     Uses MMD loss to align the distributions from both encoders.
     """
-    def __init__(self, source_dim, target_dim, latent_dim=32, hidden_dim=64):
-        super(SCVISharedLatentEncoder, self).__init__()
+    def __init__(self, source_dim, target_dim, latent_dim=32, hidden_dim=64, target_scvi_model=None):
+        super(SCVISharedLatentEncoderWithScVIDecoder, self).__init__()
         
         # Define dimensions for the model
         self.source_dim = source_dim
         self.target_dim = target_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.target_scvi_model = target_scvi_model
         
         # Source encoder projection network
         # Takes scVI latent rep as input and projects to shared space
@@ -62,22 +65,15 @@ class SCVISharedLatentEncoder(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
         
-        # Add decoder network for target feature prediction
-        decoder_dims = [latent_dim, hidden_dim*2, hidden_dim*4, hidden_dim*8, target_dim]
-        decoder_layers = []
-        
-        for i in range(len(decoder_dims)-1):
-            decoder_layers.extend([
-                nn.Linear(decoder_dims[i], decoder_dims[i+1]),
-                nn.BatchNorm1d(decoder_dims[i+1]),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.3)
-            ])
-        
-        # Remove last activation and dropout for final layer
-        decoder_layers = decoder_layers[:-2]
-        
-        self.decoder = nn.Sequential(*decoder_layers)
+        # Projection from shared latent space to target scVI latent space
+        # This maps our shared latent space back to the format expected by scVI decoder
+        self.latent_to_target_scvi = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, target_dim)
+        )
     
     def project_source(self, x):
         return self.source_projector(x)
@@ -85,9 +81,47 @@ class SCVISharedLatentEncoder(nn.Module):
     def project_target(self, x):
         return self.target_projector(x)
     
+    def map_to_target_latent(self, z):
+        """Map from shared latent space to target scVI latent space"""
+        return self.latent_to_target_scvi(z)
+    
     def decode(self, z):
-        """Decode latent representation to target feature space."""
-        return self.decoder(z)
+        """Decode latent representation to target feature space using scVI decoder."""
+        # First map the shared latent space to target scVI latent space
+        z_target_scvi = self.map_to_target_latent(z)
+        
+        # Use the target scVI model's decoder
+        # We need to put in inference mode and ensure no gradients are computed for scVI internals
+        with torch.no_grad():
+            self.target_scvi_model.module.eval()  # Set to eval mode
+            
+            # Get batch size
+            batch_size = z_target_scvi.size(0)
+            
+            # Generate samples from the decoder using our mapped latent values
+            # This reconstructs the gene expression from the latent space
+            decoder_input = {
+                'z': z_target_scvi,  # Latent space representation
+                'library': torch.ones_like(z_target_scvi[:, :1]),  # Library size (set to 1 for normalization)
+                'batch_index': torch.zeros(batch_size, dtype=torch.long, device=z_target_scvi.device)  # Assuming single batch
+            }
+            
+            # Get the mean of the negative binomial distribution (expected gene expression)
+            generative_outputs = self.target_scvi_model.module.generative(**decoder_input)
+            
+            # The structure of the output depends on the version of scVI
+            # For newer versions, px is a distribution object, not a dictionary
+            if hasattr(generative_outputs['px'], 'rate'):
+                # Access the rate attribute directly from the distribution object
+                decoded_gene_expression = generative_outputs['px'].rate
+            elif isinstance(generative_outputs['px'], dict) and 'rate' in generative_outputs['px']:
+                # For older versions where px is a dictionary with rate key
+                decoded_gene_expression = generative_outputs['px']['rate']
+            else:
+                # Fallback to getting the mean of the distribution
+                decoded_gene_expression = generative_outputs['px'].mean
+            
+        return decoded_gene_expression
     
     def forward(self, x_source, x_target=None):
         if x_target is not None:
@@ -241,125 +275,142 @@ def load_data(source_model_path, target_model_path, source_adata_path, target_ad
         'source_ids': source_cell_ids,
         'target_ids': target_cell_ids,
         'source_adata': source_adata,
-        'target_adata': target_adata
+        'target_adata': target_adata,
+        'source_model': source_model,
+        'target_model': target_model  # Store the target model for decoding
     }
     
     return X_source_paired, X_target_paired, cell_metadata
 
 def visualize_latent_space(shared_latent_source, shared_latent_target, cell_metadata, output_dir, title_suffix=""):
     """
-    Visualize the shared latent space using UMAP.
+    Visualize the shared latent space using UMAP with scanpy plotting functions.
     Color points by dataset source and by cell clusters.
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Combine both latent representations
+    # Create an AnnData object to hold the combined data
     combined_latent = np.vstack([shared_latent_source, shared_latent_target])
     dataset_labels = np.array(['Source'] * len(shared_latent_source) + ['Target'] * len(shared_latent_target))
     
-    # Get original cluster labels from AnnData objects, if they exist
-    source_clusters = None
-    target_clusters = None
+    # Create metadata for plotting
+    obs_df = pd.DataFrame({
+        'dataset': dataset_labels,
+        'cell_type': np.zeros(len(combined_latent), dtype=str)  # Will be filled in if clusters exist
+    })
     
+    # Add cell IDs if available
+    if 'source_ids' in cell_metadata and 'target_ids' in cell_metadata:
+        cell_ids = np.concatenate([cell_metadata['source_ids'], cell_metadata['target_ids']])
+        obs_df.index = cell_ids
+    else:
+        obs_df.index = [f'cell_{i}' for i in range(len(combined_latent))]
+    
+    # Create AnnData object
+    adata = sc.AnnData(X=combined_latent, obs=obs_df)
+    
+    # Get original cluster labels from AnnData objects, if they exist
     source_adata = cell_metadata['source_adata']
     target_adata = cell_metadata['target_adata']
     
-    # Try to get cluster information from original anndata
-    if 'leiden' in source_adata.obs.columns:
-        source_ids = cell_metadata['source_ids']
-        source_id_to_idx = {id: i for i, id in enumerate(source_adata.obs_names)}
-        source_indices = [source_id_to_idx.get(id) for id in source_ids if id in source_id_to_idx]
-        if source_indices:
-            source_clusters = source_adata.obs['leiden'].iloc[source_indices].values
-        else:
-            source_clusters = None
-            print("Warning: Could not find any matching source cell indices")
+    # Try to get cluster information and fill in obs
+    have_clusters = False
+    if 'leiden' in source_adata.obs.columns and 'leiden' in target_adata.obs.columns:
+        try:
+            # Match source clusters
+            source_ids = cell_metadata['source_ids']
+            source_id_to_idx = {id: i for i, id in enumerate(source_adata.obs_names)}
+            source_indices = [source_id_to_idx.get(id) for id in source_ids if id in source_id_to_idx]
+            
+            # Match target clusters
+            target_ids = cell_metadata['target_ids']
+            target_id_to_idx = {id: i for i, id in enumerate(target_adata.obs_names)}
+            target_indices = [target_id_to_idx.get(id) for id in target_ids if id in target_id_to_idx]
+            
+            if source_indices and target_indices:
+                source_clusters = source_adata.obs['leiden'].iloc[source_indices].values
+                target_clusters = target_adata.obs['leiden'].iloc[target_indices].values
+                
+                # Combine clusters
+                all_clusters = np.concatenate([source_clusters, target_clusters])
+                adata.obs['cluster'] = all_clusters
+                have_clusters = True
+                print(f"Successfully matched clusters for {len(source_indices)} source cells and {len(target_indices)} target cells")
+        except Exception as e:
+            print(f"Error matching clusters: {e}")
+            have_clusters = False
     
-    if 'leiden' in target_adata.obs.columns:
-        target_ids = cell_metadata['target_ids']
-        target_id_to_idx = {id: i for i, id in enumerate(target_adata.obs_names)}
-        target_indices = [target_id_to_idx.get(id) for id in target_ids if id in target_id_to_idx]
-        if target_indices:
-            target_clusters = target_adata.obs['leiden'].iloc[target_indices].values
-        else:
-            target_clusters = None
-            print("Warning: Could not find any matching target cell indices")
-    
-    # Run UMAP
+    # Run UMAP with scanpy with parameters to handle potential spectral initialization issues
     print("Running UMAP...")
-    reducer = umap.UMAP(random_state=42)
-    latent_umap = reducer.fit_transform(combined_latent)
+    # Add a small amount of random noise to prevent spectral initialization issues
+    adata_copy = adata.copy()
+    noise = np.random.normal(0, 0.0001, size=adata_copy.X.shape)
+    adata_copy.X = adata_copy.X + noise
     
-    # Plot by dataset source (UMAP)
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(latent_umap[:, 0], latent_umap[:, 1], 
-                         c=[0 if x == 'Source' else 1 for x in dataset_labels],
-                         cmap='coolwarm', s=5, alpha=0.7)
-    plt.colorbar(scatter, ticks=[0, 1], label='Dataset')
-    plt.title(f'Shared Latent Space (UMAP) - By Dataset {title_suffix}')
-    plt.savefig(f"{output_dir}/latent_umap_dataset{title_suffix.replace(' ', '_')}.png", dpi=300)
-    plt.close()
+    # Use more robust parameters for neighbor computation
+    sc.pp.neighbors(adata_copy, use_rep='X', n_neighbors=30, method='umap')
     
-    # Plot by cluster if we have that information
-    if source_clusters is not None and target_clusters is not None:
-        # Combine cluster labels from both datasets
-        all_clusters = np.concatenate([source_clusters, target_clusters])
-        
-        # Create a color map for clusters
-        unique_clusters = np.unique(all_clusters)
-        n_clusters = len(unique_clusters)
-        color_map = plt.cm.get_cmap('tab20', n_clusters)
-        
-        # Map cluster labels to numbers for coloring
-        cluster_to_int = {cluster: i for i, cluster in enumerate(unique_clusters)}
-        cluster_colors = [cluster_to_int[cluster] for cluster in all_clusters]
-        
-        # Plot UMAP by cluster
-        plt.figure(figsize=(12, 10))
-        scatter = plt.scatter(latent_umap[:, 0], latent_umap[:, 1], 
-                            c=cluster_colors, cmap='tab20', s=5, alpha=0.7)
-        plt.title(f'Shared Latent Space (UMAP) - By Cluster {title_suffix}')
-        legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-                                    markerfacecolor=color_map(cluster_to_int[cluster]), 
-                                    label=f'Cluster {cluster}') 
-                         for cluster in unique_clusters]
-        plt.legend(handles=legend_elements, title="Clusters", loc="upper right")
-        plt.savefig(f"{output_dir}/latent_umap_clusters{title_suffix.replace(' ', '_')}.png", dpi=300)
-        plt.close()
+    # Set UMAP parameters to avoid spectral initialization issues
+    sc.tl.umap(adata_copy, min_dist=0.3, spread=1.0, random_state=42, 
+               init_pos='random', n_components=2)
     
-    # Split visualization to show source vs target alignment
+    # Plot the UMAPs
+    sc.settings.set_figure_params(dpi=120, frameon=False, figsize=(8, 8))
+    
+    # Set the scanpy figures directory to our output directory
+    sc.settings.figdir = output_dir
+    
+    # Plot by dataset
+    print("Generating dataset UMAP plot...")
+    sc.pl.umap(adata_copy, color='dataset', 
+               title=f'Shared Latent Space - By Dataset {title_suffix}',
+               palette={'Source': 'blue', 'Target': 'red'},
+               size=30, alpha=0.7, legend_loc='on data',
+               save=f"dataset{title_suffix.replace(' ', '_')}.png")
+    
+    # Plot by clusters if available
+    if have_clusters:
+        print("Generating cluster UMAP plot...")
+        # Copy cluster info to the noise-added object
+        adata_copy.obs['cluster'] = adata.obs['cluster']
+        sc.pl.umap(adata_copy, color='cluster', 
+                   title=f'Shared Latent Space - By Cluster {title_suffix}',
+                   palette='tab20', size=30, alpha=0.7, legend_loc='on data',
+                   save=f"clusters{title_suffix.replace(' ', '_')}.png")
+    
+    # Create separate AnnData objects for source and target using the noise-added data
     n_source = len(shared_latent_source)
-    source_umap = latent_umap[:n_source]
-    target_umap = latent_umap[n_source:]
+    adata_source = adata_copy[:n_source].copy()
+    adata_target = adata_copy[n_source:].copy()
     
-    # Plot side-by-side UMAP
-    plt.figure(figsize=(16, 7))
+    # Side-by-side plots using scanpy's function
+    print("Generating side-by-side comparison...")
     
-    plt.subplot(1, 2, 1)
-    plt.scatter(source_umap[:, 0], source_umap[:, 1], c='blue', s=5, alpha=0.7, label='Source')
-    plt.title('Source Dataset - UMAP')
+    # Source dataset
+    sc.pl.umap(adata_source, title=f'Source Dataset {title_suffix}',
+               size=30, alpha=0.7, color='dataset',
+               save=f"source{title_suffix.replace(' ', '_')}.png")
     
-    plt.subplot(1, 2, 2)
-    plt.scatter(target_umap[:, 0], target_umap[:, 1], c='red', s=5, alpha=0.7, label='Target')
-    plt.title('Target Dataset - UMAP')
+    # Target dataset
+    sc.pl.umap(adata_target, title=f'Target Dataset {title_suffix}',
+               size=30, alpha=0.7, color='dataset',
+               save=f"target{title_suffix.replace(' ', '_')}.png")
     
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/latent_umap_comparison{title_suffix.replace(' ', '_')}.png", dpi=300)
-    plt.close()
+    # Create a joint visualization with scanpy
+    print("Generating joint visualization...")
+    with plt.rc_context({'figure.figsize': (12, 10)}):
+        sc.pl.umap(adata_copy, color='dataset', palette={'Source': 'blue', 'Target': 'red'},
+                   title=f'Shared Latent Space - Joint View {title_suffix}',
+                   alpha=0.6, size=30, legend_loc='on data',
+                   save=f"joint{title_suffix.replace(' ', '_')}.png")
     
-    # Create a joint visualization with transparency
-    plt.figure(figsize=(12, 10))
-    plt.scatter(source_umap[:, 0], source_umap[:, 1], c='blue', s=5, alpha=0.5, label='Source')
-    plt.scatter(target_umap[:, 0], target_umap[:, 1], c='red', s=5, alpha=0.5, label='Target')
-    plt.legend()
-    plt.title(f'Shared Latent Space (UMAP) - Joint View {title_suffix}')
-    plt.savefig(f"{output_dir}/latent_umap_joint{title_suffix.replace(' ', '_')}.png", dpi=300)
-    plt.close()
+    print(f"All UMAP visualizations saved to {output_dir}")
     
     # Return the latent embeddings for further analysis
     return {
-        'umap': latent_umap,
-        'n_source': n_source
+        'umap': adata_copy.obsm['X_umap'],
+        'n_source': n_source,
+        'adata': adata_copy
     }
 
 def compute_cluster_consistency_loss(z_source, z_target, source_labels, target_labels):
@@ -446,12 +497,16 @@ def train_shared_latent_model(config):
         shuffle=False
     )
     
-    # Initialize the model
-    model = SCVISharedLatentEncoder(
+    # Access the target scVI model's module
+    target_scvi_model = cell_metadata['target_model'].module
+    
+    # Initialize the model with target scVI decoder
+    model = SCVISharedLatentEncoderWithScVIDecoder(
         source_dim=X_source.shape[1],
         target_dim=X_target.shape[1],
         latent_dim=config['latent_dim'],
-        hidden_dim=config['hidden_dim']
+        hidden_dim=config['hidden_dim'],
+        target_scvi_model=cell_metadata['target_model']
     )
     
     # Set up device (GPU/MPS if available)
@@ -505,9 +560,14 @@ def train_shared_latent_model(config):
                 # MMD loss to align the latent distributions from both encoders
                 mmd_loss_val = mmd_loss(z_source, z_target)
                 
-                # Reconstruction loss - both encoders should produce representations
-                # that decode to the target features (larger feature set)
-                recon_loss = F.mse_loss(recon_source, x_target) + F.mse_loss(recon_target, x_target)
+                # Reconstruction loss using the latent representation alignment
+                # Since we're using scVI's decoder, the reconstructions are in gene expression space (5001 dims)
+                # But our x_target is still in scVI latent space (10 dims)
+                # So we compute the loss on the shared latent space instead
+                
+                # Map z_target back to target scVI latent space for comparison with x_target
+                z_target_projection = model.map_to_target_latent(z_target)
+                recon_loss = F.mse_loss(z_target_projection, x_target)
                 
                 # Get cluster labels if available
                 cluster_loss = torch.tensor(0.0).to(device)
@@ -561,7 +621,7 @@ def train_shared_latent_model(config):
         # Save model if validation loss improved
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), f"{output_dir}/models/best_model_{run_id}.pt")
+            torch.save(model.state_dict(), f"{output_dir}/models/best_model_scvi_decoder_{run_id}.pt")
             print(f"New best model saved with validation loss: {best_val_loss:.6f}")
             early_stopping_counter = 0
             
@@ -590,7 +650,7 @@ def train_shared_latent_model(config):
                     all_target_latent, 
                     cell_metadata,
                     f"{output_dir}/results",
-                    f"Epoch {epoch+1}"
+                    f"Epoch {epoch+1} (scVI Decoder)"
                 )
         else:
             early_stopping_counter += 1
@@ -609,14 +669,14 @@ def train_shared_latent_model(config):
     plt.plot(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('MMD Loss')
-    plt.title('Training and Validation Loss')
+    plt.title('Training and Validation Loss (scVI Decoder)')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f"{output_dir}/results/loss_curve_{run_id}.png", dpi=300)
+    plt.savefig(f"{output_dir}/results/loss_curve_scvi_decoder_{run_id}.png", dpi=300)
     plt.close()
     
     # Load the best model for final evaluation
-    model.load_state_dict(torch.load(f"{output_dir}/models/best_model_{run_id}.pt"))
+    model.load_state_dict(torch.load(f"{output_dir}/models/best_model_scvi_decoder_{run_id}.pt"))
     model.eval()
     
     # Final latent space visualization with the best model
@@ -642,12 +702,12 @@ def train_shared_latent_model(config):
         all_target_latent, 
         cell_metadata,
         f"{output_dir}/results",
-        "Final"
+        "Final (scVI Decoder)"
     )
     
     # Save embeddings for later use
-    np.save(f"{output_dir}/results/source_latent_embeddings_{run_id}.npy", all_source_latent)
-    np.save(f"{output_dir}/results/target_latent_embeddings_{run_id}.npy", all_target_latent)
+    np.save(f"{output_dir}/results/source_latent_embeddings_scvi_decoder_{run_id}.npy", all_source_latent)
+    np.save(f"{output_dir}/results/target_latent_embeddings_scvi_decoder_{run_id}.npy", all_target_latent)
     
     return model, run_id
 
@@ -699,4 +759,4 @@ if __name__ == "__main__":
     
     print(f"\nTraining complete! Run ID: {run_id}")
     print(f"Results saved in {config['output_dir']}/results")
-    print(f"Best model saved in {config['output_dir']}/models/best_model_{run_id}.pt")
+    print(f"Best model saved in {config['output_dir']}/models/best_model_scvi_decoder_{run_id}.pt")
