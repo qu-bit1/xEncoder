@@ -1,3 +1,5 @@
+# plan
+
 ## Problem Statement
 This project addresses a spatial transcriptomics problem where we have two datasets from same tissue. One has less number of genes than the other for
 about the same number of cells. The task is to train a model such that when inferencing with the dataset with less number of genes it predicts the 

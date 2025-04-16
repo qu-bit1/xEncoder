@@ -1,0 +1,11 @@
+cl_annotations1 = {
+    '1': "Epithelial", '2': "Fibroblasts", '0': "T cells", '3': "Macrophages", '4': "Endothelial",
+    '5': "Endothelial", '6': "Smooth muscles", '7': "Epithelial", '8': "Epithelial", '9': "B cells",
+    '10': "Epithelial", '11': "Plasma cells", '12': "Epithelial"
+}
+
+cl_annotations2 = {
+    '1': "Endothelial", '2': "Fibroblasts", '0': "T cells", '4': "Macrophages", '3': "Epithelial",
+    '5': "Endothelial", '6': "Epithelial", '7': "Epithelial", '8': "B cells", '9': "Endothelial",
+    '10': "Mast cells", '11': "Macrophages"
+}
