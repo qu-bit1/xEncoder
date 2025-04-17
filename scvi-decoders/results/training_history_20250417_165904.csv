@@ -1,0 +1,44 @@
+kl_weight,train_loss_step,train_loss_epoch,elbo_train,reconstruction_loss_train,kl_local_train,kl_global_train
+"      kl_weight
+epoch          
+0           0.0
+1        0.0025
+2         0.005
+3        0.0075
+4          0.01","      train_loss_step
+epoch                
+0          543.591919
+1          532.502563
+2          523.816467
+3          528.505249
+4          523.636597","      train_loss_epoch
+epoch                 
+0           570.574463
+1           540.016602
+2           531.989746
+3           526.710327
+4           522.712952","       elbo_train
+epoch            
+0      598.232056
+1      581.328491
+2      574.484619
+3      566.465027
+4      559.344971","      reconstruction_loss_train
+epoch                          
+0                    570.574463
+1                    539.913025
+2                    531.776428
+3                    526.410095
+4                    522.342896","      kl_local_train
+epoch               
+0          27.657614
+1          41.415436
+2          42.708218
+3          40.054928
+4          37.002045","      kl_global_train
+epoch                
+0                 0.0
+1                 0.0
+2                 0.0
+3                 0.0
+4                 0.0"
