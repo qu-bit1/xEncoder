@@ -1,4 +1,3 @@
-
 import os
 import sys
 import torch
@@ -21,19 +20,22 @@ import matplotlib.colors as mcolors
 # Set precision for better GPU performance
 torch.set_float32_matmul_precision('high')
 
-class SCVISharedLatentEncoder(nn.Module):
+class SCVISharedLatentEncoderWithScVIDecoder(nn.Module):
     """
-    A model that combines two pre-trained scVI encoders and projects them into a shared latent space.
+    A model that combines two pre-trained scVI encoders and a pre-trained scVI decoder.
+    Projects source and target latent representations into a shared latent space,
+    then uses the target scVI model's decoder to reconstruct target features.
     Uses MMD loss to align the distributions from both encoders.
     """
-    def __init__(self, source_dim, target_dim, latent_dim=32, hidden_dim=64):
-        super(SCVISharedLatentEncoder, self).__init__()
+    def __init__(self, source_dim, target_dim, latent_dim=32, hidden_dim=64, target_scvi_model=None):
+        super(SCVISharedLatentEncoderWithScVIDecoder, self).__init__()
         
         # Define dimensions for the model
         self.source_dim = source_dim
         self.target_dim = target_dim
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
+        self.target_scvi_model = target_scvi_model
         
         # Source encoder projection network
         # Takes scVI latent rep as input and projects to shared space
@@ -63,22 +65,15 @@ class SCVISharedLatentEncoder(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
         
-        # Add decoder network for target feature prediction
-        decoder_dims = [latent_dim, hidden_dim*2, hidden_dim*4, hidden_dim*8, target_dim]
-        decoder_layers = []
-        
-        for i in range(len(decoder_dims)-1):
-            decoder_layers.extend([
-                nn.Linear(decoder_dims[i], decoder_dims[i+1]),
-                nn.BatchNorm1d(decoder_dims[i+1]),
-                nn.LeakyReLU(0.2),
-                nn.Dropout(0.3)
-            ])
-        
-        # Remove last activation and dropout for final layer
-        decoder_layers = decoder_layers[:-2]
-        
-        self.decoder = nn.Sequential(*decoder_layers)
+        # Projection from shared latent space to target scVI latent space
+        # This maps our shared latent space back to the format expected by scVI decoder
+        self.latent_to_target_scvi = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, target_dim)
+        )
     
     def project_source(self, x):
         return self.source_projector(x)
@@ -86,13 +81,50 @@ class SCVISharedLatentEncoder(nn.Module):
     def project_target(self, x):
         return self.target_projector(x)
     
+    def map_to_target_latent(self, z):
+        """Map from shared latent space to target scVI latent space"""
+        return self.latent_to_target_scvi(z)
+    
     def decode(self, z):
-        """Decode latent representation to target feature space."""
-        return self.decoder(z)
+        """Decode latent representation to target feature space using scVI decoder."""
+        # First map the shared latent space to target scVI latent space
+        z_target_scvi = self.map_to_target_latent(z)
+        
+        # Use the target scVI model's decoder
+        # We need to put in inference mode and ensure no gradients are computed for scVI internals
+        with torch.no_grad():
+            self.target_scvi_model.module.eval()  # Set to eval mode
+            
+            # Get batch size
+            batch_size = z_target_scvi.size(0)
+            
+            # Generate samples from the decoder using our mapped latent values
+            # This reconstructs the gene expression from the latent space
+            decoder_input = {
+                'z': z_target_scvi,  # Latent space representation
+                'library': torch.ones_like(z_target_scvi[:, :1]),  # Library size (set to 1 for normalization)
+                'batch_index': torch.zeros(batch_size, dtype=torch.long, device=z_target_scvi.device)  # Assuming single batch
+            }
+            
+            # Get the mean of the negative binomial distribution (expected gene expression)
+            generative_outputs = self.target_scvi_model.module.generative(**decoder_input)
+            
+            # Access the rate attribute more robustly
+            if hasattr(generative_outputs['px'], 'rate'):
+                # For newer scVI versions that use distribution objects
+                decoded_gene_expression = generative_outputs['px'].rate
+            elif isinstance(generative_outputs['px'], dict) and 'rate' in generative_outputs['px']:
+                # For older versions that use dictionaries
+                decoded_gene_expression = generative_outputs['px']['rate']
+            else:
+                # Fallback to getting the mean of the distribution
+                decoded_gene_expression = generative_outputs['px'].mean
+            
+        return decoded_gene_expression
     
     def forward(self, x_source, x_target=None):
+        # Training mode with both inputs
         if x_target is not None:
-            # Training mode with both inputs
             z_source = self.project_source(x_source)
             z_target = self.project_target(x_target)
             
@@ -102,13 +134,14 @@ class SCVISharedLatentEncoder(nn.Module):
             recon_target = self.decode(z_target)  # Target encoder -> shared space -> target reconstruction
             
             return z_source, z_target, recon_source, recon_target
+        # Inference mode with only source input
         else:
-            # Inference mode with only source input
             z_source = self.project_source(x_source)
             recon_source = self.decode(z_source)
             return z_source, recon_source
 
-def mmd_loss(x, y, kernel='rbf', sigma_list=[0.01, 0.1, 1, 10, 100]):
+
+def mmd_loss(x, y, kernel='rbf', sigma_list=None):
     """
     Maximum Mean Discrepancy (MMD) loss with multiple RBF kernels.
     This encourages the distributions to match across the entire space.
@@ -119,6 +152,10 @@ def mmd_loss(x, y, kernel='rbf', sigma_list=[0.01, 0.1, 1, 10, 100]):
         kernel: Kernel type (only rbf supported)
         sigma_list: List of sigma values for the RBF kernels
     """
+    if sigma_list is None:
+        # Default sigma values spanning multiple scales
+        sigma_list = [0.01, 0.1, 1, 10, 100]
+        
     x_size = x.size(0)
     y_size = y.size(0)
     dim = x.size(1)
@@ -128,12 +165,20 @@ def mmd_loss(x, y, kernel='rbf', sigma_list=[0.01, 0.1, 1, 10, 100]):
         # Fallback to simpler implementation or MSE
         return F.mse_loss(x.mean(0), y.mean(0))
     
-    # Expand the tensors to compute pairwise distances
-    tiled_x = x.unsqueeze(1).expand(x_size, y_size, dim)
-    tiled_y = y.unsqueeze(0).expand(x_size, y_size, dim)
+    # Compute pairwise distances more efficiently
+    xx = torch.mm(x, x.t())
+    yy = torch.mm(y, y.t())
+    xy = torch.mm(x, y.t())
     
-    # Compute pairwise squared Euclidean distances
-    l2_distance_matrix = ((tiled_x - tiled_y) ** 2).sum(2)
+    # Compute the squared norms
+    x_norm = torch.diag(xx)
+    y_norm = torch.diag(yy)
+    
+    # Compute pairwise squared distances using kernel trick
+    # ||x_i - x_j||^2 = ||x_i||^2 + ||x_j||^2 - 2 * <x_i, x_j>
+    dist_xx = x_norm.unsqueeze(1) + x_norm.unsqueeze(0) - 2 * xx
+    dist_yy = y_norm.unsqueeze(1) + y_norm.unsqueeze(0) - 2 * yy
+    dist_xy = x_norm.unsqueeze(1) + y_norm.unsqueeze(0) - 2 * xy
     
     # Apply multiple RBF kernels and sum the results
     mmd_loss_value = 0.0
@@ -141,25 +186,26 @@ def mmd_loss(x, y, kernel='rbf', sigma_list=[0.01, 0.1, 1, 10, 100]):
         gamma = 1.0 / (2 * sigma ** 2)
         
         # Compute kernel values
-        xx_kernel = torch.exp(-gamma * ((x.unsqueeze(1) - x.unsqueeze(0)) ** 2).sum(2))
-        yy_kernel = torch.exp(-gamma * ((y.unsqueeze(1) - y.unsqueeze(0)) ** 2).sum(2))
-        xy_kernel = torch.exp(-gamma * l2_distance_matrix)
+        k_xx = torch.exp(-gamma * dist_xx)
+        k_yy = torch.exp(-gamma * dist_yy)
+        k_xy = torch.exp(-gamma * dist_xy)
         
-        # Compute means (we exclude diagonal elements for xx and yy kernels)
-        xx_mean = (xx_kernel.sum() - torch.trace(xx_kernel)) / max(1, (x_size * (x_size - 1)))
-        yy_mean = (yy_kernel.sum() - torch.trace(yy_kernel)) / max(1, (y_size * (y_size - 1)))
-        xy_mean = xy_kernel.mean()
+        # Compute means (excluding diagonal elements for xx and yy kernels)
+        k_xx_sum = (k_xx.sum() - torch.trace(k_xx)) / (x_size * (x_size - 1))
+        k_yy_sum = (k_yy.sum() - torch.trace(k_yy)) / (y_size * (y_size - 1))
+        k_xy_sum = k_xy.mean()
         
         # Add to total MMD loss
-        mmd_loss_value += xx_mean + yy_mean - 2 * xy_mean
+        mmd_loss_value += k_xx_sum + k_yy_sum - 2 * k_xy_sum
     
     return mmd_loss_value
 
-def load_data(source_model_path, target_model_path, source_adata_path, target_adata_path, mapping_path):
+
+def load_data(source_model_path, target_model_path, decoder_model_path, source_adata_path, target_adata_path, mapping_path):
     """
     Load data and prepare for training:
     1. Load the pre-trained scVI models
-    2. Extract latent representations
+    2. Extract latent representations and gene expression
     3. Prepare paired data based on mapping
     """
     print("Loading datasets and models...")
@@ -175,15 +221,23 @@ def load_data(source_model_path, target_model_path, source_adata_path, target_ad
     # Load the pre-trained models with their corresponding AnnData objects
     source_model = scvi.model.SCVI.load(source_model_path, adata=source_adata)
     target_model = scvi.model.SCVI.load(target_model_path, adata=target_adata)
+    decoder_model = scvi.model.SCVI.load(decoder_model_path, adata=target_adata)
     
     # Load cell mappings
     mapping_df = pd.read_csv(mapping_path)
     print(f"Loaded mapping file with {len(mapping_df)} rows")
     
-    # Extract latent representations
-    print("Extracting latent representations...")
+    # Extract latent representations and gene expression
+    print("Extracting latent representations and gene expression...")
     source_latent = source_model.get_latent_representation()
     target_latent = target_model.get_latent_representation()
+    
+    # Handle sparse matrix if needed
+    if isinstance(target_adata.X, np.ndarray):
+        target_expression = target_adata.X
+    else:
+        # Convert sparse to dense array
+        target_expression = target_adata.X.toarray()
     
     # Create dictionaries for cell name to index mapping
     source_cell_to_idx = {cell: idx for idx, cell in enumerate(source_adata.obs_names)}
@@ -192,6 +246,7 @@ def load_data(source_model_path, target_model_path, source_adata_path, target_ad
     # Create training pairs based on mapping, handling one-to-many relationships
     X_source_paired = []
     X_target_paired = []
+    Y_target_paired = []  # Store target gene expression
     source_cell_ids = []
     target_cell_ids = []
     
@@ -217,6 +272,7 @@ def load_data(source_model_path, target_model_path, source_adata_path, target_ad
                     # Add this pair to our training data
                     X_source_paired.append(source_latent[source_idx])
                     X_target_paired.append(target_latent[target_idx])
+                    Y_target_paired.append(target_expression[target_idx])  # Add target gene expression
                     source_cell_ids.append(source_id)
                     target_cell_ids.append(target_id)
                     valid_target_pairs += 1
@@ -230,12 +286,15 @@ def load_data(source_model_path, target_model_path, source_adata_path, target_ad
     print(f"Successfully matched {successful_mappings} cell pairs out of {total_mappings} mappings ({successful_mappings/total_mappings:.2%})")
     print(f"Used {unique_source_cells} unique source cells with an average of {successful_mappings/max(1, unique_source_cells):.2f} target cells per source cell")
     
+    # Convert to numpy arrays
     X_source_paired = np.stack(X_source_paired)
     X_target_paired = np.stack(X_target_paired)
+    Y_target_paired = np.stack(Y_target_paired)
     
     print(f"Final paired data shapes:")
     print(f"Source latent: {X_source_paired.shape}")
     print(f"Target latent: {X_target_paired.shape}")
+    print(f"Target expression: {Y_target_paired.shape}")
     
     # Store cell metadata for later visualization
     cell_metadata = {
@@ -245,132 +304,135 @@ def load_data(source_model_path, target_model_path, source_adata_path, target_ad
         'target_adata': target_adata
     }
     
-    return X_source_paired, X_target_paired, cell_metadata
+    return X_source_paired, X_target_paired, Y_target_paired, cell_metadata, decoder_model
+
 
 def visualize_latent_space(shared_latent_source, shared_latent_target, cell_metadata, output_dir, title_suffix=""):
     """
-    Visualize the shared latent space using UMAP.
-    Color points by dataset source and by cell clusters.
+    Visualize the shared latent space using UMAP with scanpy plotting functions.
+    Color points by cell clusters for source, target, and joint datasets.
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    # Combine both latent representations
+    # Create an AnnData object to hold the combined data
     combined_latent = np.vstack([shared_latent_source, shared_latent_target])
     dataset_labels = np.array(['Source'] * len(shared_latent_source) + ['Target'] * len(shared_latent_target))
     
-    # Get original cluster labels from AnnData objects, if they exist
-    source_clusters = None
-    target_clusters = None
+    # Create metadata for plotting
+    obs_df = pd.DataFrame({
+        'dataset': dataset_labels
+    })
     
-    source_adata = cell_metadata['source_adata']
-    target_adata = cell_metadata['target_adata']
+    # Add cell IDs if available
+    if 'source_ids' in cell_metadata and 'target_ids' in cell_metadata:
+        cell_ids = np.concatenate([cell_metadata['source_ids'], cell_metadata['target_ids']])
+        obs_df.index = cell_ids
+    else:
+        obs_df.index = [f'cell_{i}' for i in range(len(combined_latent))]
     
-    # Try to get cluster information from original anndata
-    if 'leiden' in source_adata.obs.columns:
+    # Create AnnData object
+    adata = sc.AnnData(X=combined_latent, obs=obs_df)
+    
+    # Get cluster column to use
+    cluster_column = None
+    for col in ['leiden', 'cell_type', 'cluster', 'louvain']:
+        if col in cell_metadata['source_adata'].obs.columns and col in cell_metadata['target_adata'].obs.columns:
+            cluster_column = col
+            break
+    
+    if not cluster_column:
+        print("No cluster information found in both source and target datasets")
+        return
+    
+    # Add cluster information
+    try:
         source_ids = cell_metadata['source_ids']
-        source_id_to_idx = {id: i for i, id in enumerate(source_adata.obs_names)}
-        source_indices = [source_id_to_idx.get(id) for id in source_ids if id in source_id_to_idx]
-        if source_indices:
-            source_clusters = source_adata.obs['leiden'].iloc[source_indices].values
-        else:
-            source_clusters = None
-            print("Warning: Could not find any matching source cell indices")
-    
-    if 'leiden' in target_adata.obs.columns:
         target_ids = cell_metadata['target_ids']
-        target_id_to_idx = {id: i for i, id in enumerate(target_adata.obs_names)}
-        target_indices = [target_id_to_idx.get(id) for id in target_ids if id in target_id_to_idx]
-        if target_indices:
-            target_clusters = target_adata.obs['leiden'].iloc[target_indices].values
-        else:
-            target_clusters = None
-            print("Warning: Could not find any matching target cell indices")
+        
+        source_adata = cell_metadata['source_adata']
+        target_adata = cell_metadata['target_adata']
+        
+        # Get cluster labels
+        source_clusters = source_adata.obs[cluster_column].loc[source_ids].values
+        target_clusters = target_adata.obs[cluster_column].loc[target_ids].values
+        
+        # Combine clusters
+        all_clusters = np.concatenate([source_clusters, target_clusters])
+        adata.obs['cluster'] = all_clusters
+        
+        print(f"Successfully matched clusters for {len(source_ids)} source cells and {len(target_ids)} target cells")
+    except Exception as e:
+        print(f"Error matching clusters: {e}")
+        return
     
     # Run UMAP
     print("Running UMAP...")
-    reducer = umap.UMAP(random_state=42)
-    latent_umap = reducer.fit_transform(combined_latent)
+    sc.pp.neighbors(adata, use_rep='X', n_neighbors=30, method='umap')
+    sc.tl.umap(adata, min_dist=0.3, spread=1.0, random_state=42, 
+               init_pos='random', n_components=2)
     
-    # Plot by dataset source (UMAP)
-    plt.figure(figsize=(10, 8))
-    scatter = plt.scatter(latent_umap[:, 0], latent_umap[:, 1], 
-                         c=[0 if x == 'Source' else 1 for x in dataset_labels],
-                         cmap='coolwarm', s=5, alpha=0.7)
-    plt.colorbar(scatter, ticks=[0, 1], label='Dataset')
-    plt.title(f'Shared Latent Space (UMAP) - By Dataset {title_suffix}')
-    plt.savefig(f"{output_dir}/latent_umap_dataset{title_suffix.replace(' ', '_')}.png", dpi=300)
-    plt.close()
+    # Set scanpy plotting parameters
+    sc.settings.set_figure_params(dpi=120, frameon=False, figsize=(8, 8))
+    sc.settings.figdir = output_dir
     
-    # Plot by cluster if we have that information
-    if source_clusters is not None and target_clusters is not None:
-        # Combine cluster labels from both datasets
-        all_clusters = np.concatenate([source_clusters, target_clusters])
-        
-        # Create a color map for clusters
-        unique_clusters = np.unique(all_clusters)
-        n_clusters = len(unique_clusters)
-        color_map = plt.cm.get_cmap('tab20', n_clusters)
-        
-        # Map cluster labels to numbers for coloring
-        cluster_to_int = {cluster: i for i, cluster in enumerate(unique_clusters)}
-        cluster_colors = [cluster_to_int[cluster] for cluster in all_clusters]
-        
-        # Plot UMAP by cluster
-        plt.figure(figsize=(12, 10))
-        scatter = plt.scatter(latent_umap[:, 0], latent_umap[:, 1], 
-                            c=cluster_colors, cmap='tab20', s=5, alpha=0.7)
-        plt.title(f'Shared Latent Space (UMAP) - By Cluster {title_suffix}')
-        legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-                                    markerfacecolor=color_map(cluster_to_int[cluster]), 
-                                    label=f'Cluster {cluster}') 
-                         for cluster in unique_clusters]
-        plt.legend(handles=legend_elements, title="Clusters", loc="upper right")
-        plt.savefig(f"{output_dir}/latent_umap_clusters{title_suffix.replace(' ', '_')}.png", dpi=300)
-        plt.close()
-    
-    # Split visualization to show source vs target alignment
+    # Create separate AnnData objects for source and target
     n_source = len(shared_latent_source)
-    source_umap = latent_umap[:n_source]
-    target_umap = latent_umap[n_source:]
+    adata_source = adata[:n_source].copy()
+    adata_target = adata[n_source:].copy()
     
-    # Plot side-by-side UMAP
-    plt.figure(figsize=(16, 7))
+    # Plot source dataset clusters
+    print("Generating source dataset cluster UMAP...")
+    sc.pl.umap(adata_source, color='cluster',
+               title='',
+               palette='tab20', size=10, alpha=0.7, 
+               legend_loc='right margin',
+               frameon=False,
+               save=f"source_latent_umap_3.png")
     
-    plt.subplot(1, 2, 1)
-    plt.scatter(source_umap[:, 0], source_umap[:, 1], c='blue', s=5, alpha=0.7, label='Source')
-    plt.title('Source Dataset - UMAP')
+    # Plot target dataset clusters
+    print("Generating target dataset cluster UMAP...")
+    sc.pl.umap(adata_target, color='cluster',
+               title='',
+               palette='tab20', size=10, alpha=0.7,
+               legend_loc='right margin',
+               frameon=False,
+               save=f"target_latent_umap_3.png")
     
-    plt.subplot(1, 2, 2)
-    plt.scatter(target_umap[:, 0], target_umap[:, 1], c='red', s=5, alpha=0.7, label='Target')
-    plt.title('Target Dataset - UMAP')
+    # Plot joint clusters
+    print("Generating joint cluster visualization...")
+    sc.pl.umap(adata, color='cluster',
+               title='',
+               palette='tab20', size=10, alpha=0.7,
+               legend_loc='right margin',
+               frameon=False,
+               save=f"joint_clusters{title_suffix.replace(' ', '_')}.png")
     
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/latent_umap_comparison{title_suffix.replace(' ', '_')}.png", dpi=300)
-    plt.close()
+    print(f"Cluster UMAP visualizations saved to {output_dir}")
     
-    # Create a joint visualization with transparency
-    plt.figure(figsize=(12, 10))
-    plt.scatter(source_umap[:, 0], source_umap[:, 1], c='blue', s=5, alpha=0.5, label='Source')
-    plt.scatter(target_umap[:, 0], target_umap[:, 1], c='red', s=5, alpha=0.5, label='Target')
-    plt.legend()
-    plt.title(f'Shared Latent Space (UMAP) - Joint View {title_suffix}')
-    plt.savefig(f"{output_dir}/latent_umap_joint{title_suffix.replace(' ', '_')}.png", dpi=300)
-    plt.close()
-    
-    # Return the latent embeddings for further analysis
     return {
-        'umap': latent_umap,
-        'n_source': n_source
+        'umap': adata.obsm['X_umap'],
+        'n_source': n_source,
+        'adata': adata
     }
+
 
 def compute_cluster_consistency_loss(z_source, z_target, source_labels, target_labels):
     """Compute loss to maintain cluster relationships."""
-    # Convert labels to one-hot encodings
-    unique_labels = torch.unique(torch.cat([source_labels, target_labels]))
+    # Get unique labels across both datasets
+    all_labels = torch.cat([source_labels, target_labels])
+    unique_labels = torch.unique(all_labels)
     n_clusters = len(unique_labels)
     
-    source_onehot = F.one_hot(source_labels, n_clusters).float()
-    target_onehot = F.one_hot(target_labels, n_clusters).float()
+    # Map original labels to indices for one-hot encoding
+    label_to_idx = {label.item(): idx for idx, label in enumerate(unique_labels)}
+    source_indices = torch.tensor([label_to_idx[label.item()] for label in source_labels], 
+                                device=z_source.device)
+    target_indices = torch.tensor([label_to_idx[label.item()] for label in target_labels], 
+                                device=z_target.device)
+    
+    # Create one-hot encodings
+    source_onehot = F.one_hot(source_indices, n_clusters).float()
+    target_onehot = F.one_hot(target_indices, n_clusters).float()
     
     # Compute cluster centroids
     source_centroids = torch.matmul(source_onehot.t(), z_source) / (source_onehot.sum(0, keepdim=True).t() + 1e-10)
@@ -380,6 +442,7 @@ def compute_cluster_consistency_loss(z_source, z_target, source_labels, target_l
     centroid_loss = F.mse_loss(source_centroids, target_centroids)
     
     return centroid_loss
+
 
 def train_shared_latent_model(config):
     """
@@ -394,9 +457,10 @@ def train_shared_latent_model(config):
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Load data
-    X_source, X_target, cell_metadata = load_data(
+    X_source, X_target, Y_target, cell_metadata, decoder_model = load_data(
         config['source_model_path'],
         config['target_model_path'],
+        config['decoder_model_path'],
         config['source_adata_path'],
         config['target_adata_path'],
         config['mapping_path']
@@ -407,25 +471,71 @@ def train_shared_latent_model(config):
     target_cell_ids_np = np.array(cell_metadata['target_ids'])
     
     # Create dictionaries for cell name to index mapping 
-    source_cell_to_idx = {cell: idx for idx, cell in enumerate(cell_metadata['source_adata'].obs_names)}
-    target_cell_to_idx = {cell: idx for idx, cell in enumerate(cell_metadata['target_adata'].obs_names)}
+    source_adata = cell_metadata['source_adata']
+    target_adata = cell_metadata['target_adata']
+    source_cell_to_idx = {cell: idx for idx, cell in enumerate(source_adata.obs_names)}
+    target_cell_to_idx = {cell: idx for idx, cell in enumerate(target_adata.obs_names)}
     
-    # Custom dataset for handling cell IDs
+    # Find cluster column to use
+    cluster_column = None
+    for col in ['leiden', 'cell_type', 'cluster', 'louvain']:
+        if col in source_adata.obs.columns and col in target_adata.obs.columns:
+            cluster_column = col
+            break
+    
+    # Get label encodings for clusters if available
+    source_cluster_map = None
+    target_cluster_map = None
+    if cluster_column:
+        if pd.api.types.is_categorical_dtype(source_adata.obs[cluster_column]):
+            source_cluster_map = {cell: code for cell, code in 
+                                zip(source_adata.obs_names, source_adata.obs[cluster_column].cat.codes)}
+            target_cluster_map = {cell: code for cell, code in 
+                                zip(target_adata.obs_names, target_adata.obs[cluster_column].cat.codes)}
+        else:
+            # Create a mapping from string values to integer codes
+            unique_clusters = set(source_adata.obs[cluster_column]) | set(target_adata.obs[cluster_column])
+            cluster_to_code = {cluster: i for i, cluster in enumerate(unique_clusters)}
+            source_cluster_map = {cell: cluster_to_code[cluster] for cell, cluster in 
+                               zip(source_adata.obs_names, source_adata.obs[cluster_column])}
+            target_cluster_map = {cell: cluster_to_code[cluster] for cell, cluster in 
+                               zip(target_adata.obs_names, target_adata.obs[cluster_column])}
+    
+    # Custom dataset for handling cell IDs and clusters
     class CellDataset(torch.utils.data.Dataset):
-        def __init__(self, source_data, target_data, source_ids, target_ids):
+        def __init__(self, source_data, target_data, target_expression, source_ids, target_ids, 
+                     source_cluster_map=None, target_cluster_map=None):
             self.source_data = torch.FloatTensor(source_data)
             self.target_data = torch.FloatTensor(target_data)
+            self.target_expression = torch.FloatTensor(target_expression)
             self.source_ids = source_ids
             self.target_ids = target_ids
+            self.source_cluster_map = source_cluster_map
+            self.target_cluster_map = target_cluster_map
             
         def __len__(self):
             return len(self.source_data)
         
         def __getitem__(self, idx):
+            source_id = self.source_ids[idx]
+            target_id = self.target_ids[idx]
+            
+            # Add cluster information if available
+            source_cluster = torch.tensor(-1, dtype=torch.long)  # Default if not available
+            target_cluster = torch.tensor(-1, dtype=torch.long)  # Default if not available
+            
+            if self.source_cluster_map and source_id in self.source_cluster_map:
+                source_cluster = torch.tensor(self.source_cluster_map[source_id], dtype=torch.long)
+                
+            if self.target_cluster_map and target_id in self.target_cluster_map:
+                target_cluster = torch.tensor(self.target_cluster_map[target_id], dtype=torch.long)
+            
             return (self.source_data[idx], self.target_data[idx], 
-                    self.source_ids[idx], self.target_ids[idx])
+                    self.target_expression[idx], source_id, target_id,
+                    source_cluster, target_cluster)
     
-    dataset = CellDataset(X_source, X_target, source_cell_ids_np, target_cell_ids_np)
+    dataset = CellDataset(X_source, X_target, Y_target, source_cell_ids_np, target_cell_ids_np,
+                          source_cluster_map, target_cluster_map)
     
     train_size = int(config['train_split'] * len(dataset))
     val_size = len(dataset) - train_size
@@ -438,21 +548,26 @@ def train_shared_latent_model(config):
     train_loader = DataLoader(
         train_dataset, 
         batch_size=config['batch_size'], 
-        shuffle=True
+        shuffle=True,
+        drop_last=False,
+        num_workers=config.get('num_workers', 0)
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=config['batch_size'], 
-        shuffle=False
+        shuffle=False,
+        drop_last=False,
+        num_workers=config.get('num_workers', 0)
     )
     
     # Initialize the model
-    model = SCVISharedLatentEncoder(
+    model = SCVISharedLatentEncoderWithScVIDecoder(
         source_dim=X_source.shape[1],
         target_dim=X_target.shape[1],
         latent_dim=config['latent_dim'],
-        hidden_dim=config['hidden_dim']
+        hidden_dim=config['hidden_dim'],
+        target_scvi_model=decoder_model
     )
     
     # Set up device (GPU/MPS if available)
@@ -486,16 +601,34 @@ def train_shared_latent_model(config):
     val_losses = []
     early_stopping_counter = 0
     
+    # For tracking losses during training
+    loss_history = {
+        'epoch': [],
+        'mmd_loss': [],
+        'recon_loss': [],
+        'cluster_loss': [],
+        'total_loss': [],
+        'val_loss': []
+    }
+    
     # Train the model
     for epoch in range(config['num_epochs']):
         model.train()
-        epoch_loss = 0
+        epoch_losses = {
+            'mmd': 0.0,
+            'recon': 0.0,
+            'cluster': 0.0,
+            'total': 0.0
+        }
         
         with tqdm(total=len(train_loader), desc=f"Epoch {epoch+1}/{config['num_epochs']}") as pbar:
-            for batch_idx, batch_data in enumerate(train_loader):
-                x_source, x_target, batch_source_ids, batch_target_ids = batch_data
+            for batch_data in train_loader:
+                x_source, x_target, y_target, source_ids, target_ids, source_clusters, target_clusters = batch_data
                 x_source = x_source.to(device)
                 x_target = x_target.to(device)
+                y_target = y_target.to(device)
+                source_clusters = source_clusters.to(device)
+                target_clusters = target_clusters.to(device)
                 
                 optimizer.zero_grad()
                 
@@ -503,26 +636,13 @@ def train_shared_latent_model(config):
                 z_source, z_target, recon_source, recon_target = model(x_source, x_target)
                 
                 # Calculate losses
-                # MMD loss to align the latent distributions from both encoders
                 mmd_loss_val = mmd_loss(z_source, z_target)
+                recon_loss = F.mse_loss(recon_source, y_target) + F.mse_loss(recon_target, y_target)
                 
-                # Reconstruction loss - both encoders should produce representations
-                # that decode to the target features (larger feature set)
-                recon_loss = F.mse_loss(recon_source, x_target) + F.mse_loss(recon_target, x_target)
-                
-                # Get cluster labels if available
+                # Compute cluster loss if clusters are available
                 cluster_loss = torch.tensor(0.0).to(device)
-                if 'leiden' in cell_metadata['source_adata'].obs.columns and \
-                   'leiden' in cell_metadata['target_adata'].obs.columns:
-                    source_indices = [source_cell_to_idx[id] for id in batch_source_ids if id in source_cell_to_idx]
-                    target_indices = [target_cell_to_idx[id] for id in batch_target_ids if id in target_cell_to_idx]
-                    
-                    if source_indices and target_indices:
-                        source_labels = torch.tensor([cell_metadata['source_adata'].obs['leiden'].cat.codes.iloc[idx] 
-                                                     for idx in source_indices], dtype=torch.long).to(device)
-                        target_labels = torch.tensor([cell_metadata['target_adata'].obs['leiden'].cat.codes.iloc[idx] 
-                                                     for idx in target_indices], dtype=torch.long).to(device)
-                        cluster_loss = compute_cluster_consistency_loss(z_source, z_target, source_labels, target_labels)
+                if (source_clusters >= 0).any() and (target_clusters >= 0).any():
+                    cluster_loss = compute_cluster_consistency_loss(z_source, z_target, source_clusters, target_clusters)
                 
                 # Combined loss
                 loss = (config['loss_weights']['mmd'] * mmd_loss_val + 
@@ -534,34 +654,52 @@ def train_shared_latent_model(config):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
                 optimizer.step()
                 
-                epoch_loss += loss.item()
+                # Update loss tracking
+                epoch_losses['mmd'] += mmd_loss_val.item()
+                epoch_losses['recon'] += recon_loss.item()
+                epoch_losses['cluster'] += cluster_loss.item()
+                epoch_losses['total'] += loss.item()
+                
                 pbar.update(1)
                 pbar.set_postfix(loss=loss.item())
         
-        avg_train_loss = epoch_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
+        # Calculate average losses for the epoch
+        for key in epoch_losses:
+            epoch_losses[key] /= len(train_loader)
         
         # Validation phase
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         
         with torch.no_grad():
             for batch_data in val_loader:
-                x_source, x_target, _, _ = batch_data
+                x_source, x_target, y_target, _, _, _, _ = batch_data
                 x_source = x_source.to(device)
                 x_target = x_target.to(device)
                 
-                z_source, z_target, recon_source, recon_target = model(x_source, x_target)
+                z_source, z_target, _, _ = model(x_source, x_target)
                 val_loss += mmd_loss(z_source, z_target).item()
         
-        avg_val_loss = val_loss / len(val_loader)
-        val_losses.append(avg_val_loss)
+        val_loss /= len(val_loader)
         
-        print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.6f}, Validation Loss = {avg_val_loss:.6f}")
+        # Update loss history
+        loss_history['epoch'].append(epoch + 1)
+        loss_history['mmd_loss'].append(epoch_losses['mmd'])
+        loss_history['recon_loss'].append(epoch_losses['recon'])
+        loss_history['cluster_loss'].append(epoch_losses['cluster'])
+        loss_history['total_loss'].append(epoch_losses['total'])
+        loss_history['val_loss'].append(val_loss)
+        
+        print(f"Epoch {epoch+1}:")
+        print(f"  MMD Loss: {epoch_losses['mmd']:.6f}")
+        print(f"  Recon Loss: {epoch_losses['recon']:.6f}")
+        print(f"  Cluster Loss: {epoch_losses['cluster']:.6f}")
+        print(f"  Total Loss: {epoch_losses['total']:.6f}")
+        print(f"  Validation Loss: {val_loss:.6f}")
         
         # Save model if validation loss improved
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             torch.save(model.state_dict(), f"{output_dir}/models/best_model_{run_id}.pt")
             print(f"New best model saved with validation loss: {best_val_loss:.6f}")
             early_stopping_counter = 0
@@ -574,11 +712,11 @@ def train_shared_latent_model(config):
                 
                 with torch.no_grad():
                     for batch_data in DataLoader(dataset, batch_size=config['batch_size']):
-                        x_source, x_target, _, _ = batch_data
+                        x_source, x_target, _, _, _, _, _ = batch_data
                         x_source = x_source.to(device)
                         x_target = x_target.to(device)
                         
-                        z_source, z_target, recon_source, recon_target = model(x_source, x_target)
+                        z_source, z_target, _, _ = model(x_source, x_target)
                         all_source_latent.append(z_source.cpu().numpy())
                         all_target_latent.append(z_target.cpu().numpy())
                 
@@ -597,20 +735,23 @@ def train_shared_latent_model(config):
             early_stopping_counter += 1
             
         # Update learning rate
-        scheduler.step(avg_val_loss)
+        scheduler.step(val_loss)
         
         # Check for early stopping
         if early_stopping_counter >= config['early_stopping_patience']:
             print(f"Early stopping triggered after {epoch+1} epochs")
             break
     
-    # Plot training and validation loss
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
+    # Plot training and validation loss using matplotlib
+    plt.figure(figsize=(12, 8))
+    plt.plot(loss_history['epoch'], loss_history['mmd_loss'], label='MMD Loss')
+    plt.plot(loss_history['epoch'], loss_history['recon_loss'], label='Reconstruction Loss')
+    plt.plot(loss_history['epoch'], loss_history['cluster_loss'], label='Cluster Loss')
+    plt.plot(loss_history['epoch'], loss_history['total_loss'], label='Total Loss')
+    plt.plot(loss_history['epoch'], loss_history['val_loss'], label='Validation Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('MMD Loss')
-    plt.title('Training and Validation Loss')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Losses')
     plt.legend()
     plt.grid(True)
     plt.savefig(f"{output_dir}/results/loss_curve_{run_id}.png", dpi=300)
@@ -626,11 +767,11 @@ def train_shared_latent_model(config):
     
     with torch.no_grad():
         for batch_data in DataLoader(dataset, batch_size=config['batch_size']):
-            x_source, x_target, _, _ = batch_data
+            x_source, x_target, _, _, _, _, _ = batch_data
             x_source = x_source.to(device)
             x_target = x_target.to(device)
             
-            z_source, z_target, recon_source, recon_target = model(x_source, x_target)
+            z_source, z_target, _, _ = model(x_source, x_target)
             all_source_latent.append(z_source.cpu().numpy())
             all_target_latent.append(z_target.cpu().numpy())
     
@@ -664,35 +805,37 @@ if __name__ == "__main__":
     # Configuration
     config = {
         # Model paths
-        'source_model_path': 'source_scvi_model',
-        'target_model_path': 'target_scvi_model',
+        'source_model_path': 'source_scvi_model/',
+        'target_model_path': 'target_scvi_model/',
+        'decoder_model_path': 'scvi-shared/decoder/models/scvi_decoder_20250417_164526',
         'source_adata_path': 'data/sq_cell_feature_1.h5ad',
         'target_adata_path': 'data/sq_cell_feature_2.h5ad',
         'mapping_path': 'data/cell_mapping.csv',
         
         # Model parameters
-        'latent_dim': 32,       # Shared latent dimension
+        'latent_dim': 10,       # Shared latent dimension
         'hidden_dim': 128,      # Hidden layer dimension for projection networks
         
         # Training parameters
-        'batch_size': 256,      # Batch size for training
+        'batch_size': 1024,     # Batch size for training
         'learning_rate': 0.001,
         'weight_decay': 1e-5,
         'num_epochs': 100,
         'train_split': 0.8,
-        'early_stopping_patience': 15,  # Increased patience for better convergence
+        'early_stopping_patience': 15,
         'grad_clip': 5.0,
         'visualize_every': 5,   # Visualize latent space every N epochs
+        'num_workers': 4,       # Number of workers for data loading
         
         # Loss weights
         'loss_weights': {
             'mmd': 1.0,          # Maximum Mean Discrepancy loss weight
-            'reconstruction': 1.0, # Increased reconstruction weight
-            'cluster': 0.2       # Increased cluster consistency weight
+            'reconstruction': 1.0, # Reconstruction loss weight
+            'cluster': 0.2       # Cluster consistency loss weight
         },
         
         # Output directory
-        'output_dir': 'scvi-shared'
+        'output_dir': 'scvi-shared/shared'
     }
     
     # Train the model
@@ -701,3 +844,4 @@ if __name__ == "__main__":
     print(f"\nTraining complete! Run ID: {run_id}")
     print(f"Results saved in {config['output_dir']}/results")
     print(f"Best model saved in {config['output_dir']}/models/best_model_{run_id}.pt")
+
